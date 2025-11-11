@@ -1,5 +1,4 @@
-flask
-flask-cors
+gradio>=3.27
 numpy
 scikit-learn
-gunicorn
+
