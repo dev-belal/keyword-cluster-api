@@ -1,73 +1,60 @@
-# main.py
-import os
-from flask import Flask, request, jsonify, abort
-from flask_cors import CORS
+# app.py
 import numpy as np
-from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import AgglomerativeClustering
+import gradio as gr
+import typing as t
 
-app = Flask(__name__)
-CORS(app)
+def cluster_payload(payload: dict) -> dict:
+    """
+    Expected payload shape:
+      {
+        "keywords": ["kw1","kw2",...],
+        "embeddings": [[...], [...], ...],
+        "threshold": 0.78    # optional, default 0.78
+      }
+    Returns:
+      {
+        "clusters": {
+            "0": ["kwA", "kwB"],
+            "1": ["kwC", "kwD", ...],
+            ...
+        },
+        "labels": [0,0,1,1,...]   # label per keyword
+      }
+    """
+    # basic validation
+    keywords = payload.get("keywords")
+    embeddings = payload.get("embeddings")
+    threshold = float(payload.get("threshold", 0.78))
 
-# Security: require an API key via header "x-api-key"
-EXPECTED_API_KEY = os.environ.get("CLUSTER_API_KEY", "dev-key")
+    if not keywords or not embeddings:
+        return {"error": "payload must include 'keywords' and 'embeddings' arrays."}
 
-# Safety limits
-MAX_EMBEDDINGS = int(os.environ.get("MAX_EMBEDDINGS", 2000))  # to avoid OOM
-MAX_KEYWORDS_PER_REQUEST = int(os.environ.get("MAX_KEYWORDS_PER_REQUEST", 2000))
+    # convert to numpy array
+    X = np.array(embeddings, dtype=float)
+    if X.ndim != 2:
+        return {"error": "embeddings must be a 2D array: list of vectors."}
+    if len(keywords) != X.shape[0]:
+        return {"error": "length of 'keywords' must match number of 'embeddings' rows."}
 
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify({"ok": True, "msg": "Keyword Clustering API ready"})
-
-@app.route("/cluster", methods=["POST"])
-def cluster():
-    # Basic auth
-    key = request.headers.get("x-api-key")
-    if key is None or key != EXPECTED_API_KEY:
-        return abort(401, "Missing or invalid API key")
-
-    data = request.json
-    if not data:
-        return abort(400, "Expected JSON body")
-
-    keywords = data.get("keywords")
-    embeddings = data.get("embeddings")
-    threshold = float(data.get("threshold", 0.78))
-    max_clusters = data.get("max_clusters")  # optional
-
-    if not isinstance(keywords, list) or not isinstance(embeddings, list):
-        return abort(400, "keywords and embeddings must be lists")
-
-    if len(keywords) != len(embeddings):
-        return abort(400, "keywords and embeddings must have same length")
-
-    n = len(keywords)
-    if n == 0:
-        return jsonify({})
-
-    if n > MAX_KEYWORDS_PER_REQUEST:
-        return abort(400, f"Too many items in request (max {MAX_KEYWORDS_PER_REQUEST})")
-
-    # Convert embeddings to numpy array
+    # compute cosine similarity matrix (N x N)
+    # numeric stability: if vectors are all zero, cosine_similarity may produce NaN
     try:
-        X = np.array(embeddings, dtype=float)
+        sim = cosine_similarity(X)
     except Exception as e:
-        return abort(400, f"Invalid embeddings format: {str(e)}")
+        return {"error": f"cosine similarity failure: {str(e)}"}
 
-    # If only 1 item, return single cluster
-    if n == 1:
-        return jsonify({"0": [keywords[0]]})
-
-    # Compute cosine similarity matrix (n x n)
-    sim = cosine_similarity(X)
-    # Convert to distance matrix for clustering
+    # convert to distance matrix for clustering
+    # distance = 1 - similarity (range ~ [0,2], but typical [0,1])
     dist = 1.0 - sim
 
-    # Agglomerative clustering with a distance threshold:
-    # clusters where (1 - cosine_similarity) <= (1 - threshold)  => similarity >= threshold
-    distance_threshold = 1.0 - threshold
+    # AgglomerativeClustering with precomputed distances
+    # we set n_clusters=None and distance_threshold to split based on threshold
+    # scikit-learn expects a symmetric matrix; we pass 'precomputed'
     try:
+        # distance_threshold = 1 - similarity_threshold
+        distance_threshold = max(0.0, 1.0 - threshold)
         model = AgglomerativeClustering(
             n_clusters=None,
             affinity="precomputed",
@@ -76,7 +63,7 @@ def cluster():
         )
         labels = model.fit_predict(dist)
     except TypeError:
-        # Older sklearn versions may not accept "affinity"; try metric param
+        # scikit-learn older/newer versions may use metric instead of affinity
         model = AgglomerativeClustering(
             n_clusters=None,
             metric="precomputed",
@@ -85,17 +72,24 @@ def cluster():
         )
         labels = model.fit_predict(dist)
 
-    # Build clusters dict: label -> list of keywords
+    # group keywords by label
     clusters = {}
-    for kw, label in zip(keywords, labels):
-        clusters.setdefault(str(int(label)), []).append(kw)
+    for kw, lbl in zip(keywords, labels):
+        clusters.setdefault(str(int(lbl)), []).append(kw)
 
-    # Optionally sort clusters by size descending
-    sorted_clusters = dict(sorted(clusters.items(), key=lambda kv: -len(kv[1])))
+    return {
+        "clusters": clusters,
+        "labels": [int(x) for x in labels]
+    }
 
-    return jsonify(sorted_clusters)
+# Gradio interface: a single JSON in/out component so the space exposes /api/predict
+with gr.Blocks() as demo:
+    gr.Markdown("## Keyword Clustering API — send a JSON payload to this Space's /api/predict")
+    input_json = gr.JSON(label="Payload JSON")
+    output_json = gr.JSON(label="Clusters")
+    btn = gr.Button("Run (for manual testing)")
+    btn.click(fn=cluster_payload, inputs=input_json, outputs=output_json)
 
-
+# `demo` app will be used by HF Spaces; below allows running locally with `python app.py`
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    demo.launch(server_name="0.0.0.0", server_port=7860)
