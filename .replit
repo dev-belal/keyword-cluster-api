@@ -4,6 +4,7 @@ expertMode = true
 
 [nix]
 channel = "stable-25_05"
+packages = ["glibcLocales"]
 
 [workflows]
 runButton = "Project"
@@ -30,5 +31,13 @@ waitForPort = 5000
 outputType = "webview"
 
 [[ports]]
+localPort = 3000
+externalPort = 3000
+
+[[ports]]
 localPort = 5000
 externalPort = 80
+
+[[ports]]
+localPort = 39095
+externalPort = 3001
